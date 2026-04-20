@@ -35,5 +35,9 @@ export type {
   NormalizationResult,
 } from './normalization.js';
 
-export type { MemoryStore, FactQuery, PatternQuery } from './store/interface.js';
-export { InMemoryStore } from './store/memory.js';
+export type {
+  MemoryStore,
+  FactQuery,
+  PatternQuery,
+} from './memory.js';
+export { InMemoryStore } from './memory.js';
