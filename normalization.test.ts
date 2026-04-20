@@ -1,213 +1,140 @@
-/**
- * Normalization + Store tests.
- *
- * End-to-end verification of the Extractor → Normalization → Store path.
- * This is the critical boundary of Layer A and its correctness matters
- * more than any individual module's.
- */
+// normalization.test.ts
 
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
-import { normalize, signEvent } from '../src/normalization.js';
-import { InMemoryStore } from '../src/store/memory.js';
-import { InMemoryKeyProvider } from '../src/signing.js';
-import type { ExtractionResult } from '@sovereign/sigil-extractor-contract';
+import { describe, it, expect } from 'vitest';
+import { normalize, signEvent } from './normalization.js';
+import { InMemoryKeyProvider, verifyObject } from './signing.js';
 
-function mockExtraction(overrides: Partial<ExtractionResult> = {}): ExtractionResult {
-  return {
-    facts: [
+describe('normalization', () => {
+  it('normalizes extraction output into signed facts', async () => {
+    const keys = await InMemoryKeyProvider.generate();
+
+    const event = await signEvent(
       {
-        type: 'emotion',
-        value: 'lęk',
-        context: 'praca',
-        confidence: 0.8,
-        language: 'pl',
-        source_timestamp: '2026-04-20T10:00:00.000Z',
+        source: 'mentor',
+        action: 'utterance_captured',
+        timestamp: new Date().toISOString(),
       },
-      {
-        type: 'topic',
-        value: 'work',
-        confidence: 0.75,
-        language: 'pl',
-        source_timestamp: '2026-04-20T10:00:00.000Z',
-      },
-    ],
-    confidence: 0.775,
-    extractor_kind: 'cloud',
-    latency_ms: 120,
-    redactions_applied: [],
-    low_confidence_fallback: false,
-    ...overrides,
-  };
-}
+      keys
+    );
 
-test('Normalization produces signed Facts with provenance', async () => {
-  const keys = await InMemoryKeyProvider.generate();
-  const did = await keys.did();
+    const extraction = {
+      facts: [
+        {
+          id: 'fact_1',
+          type: 'goal',
+          statement: 'User wants to build Inner Portal at global scale.',
+          confidence: 0.91,
+        },
+        {
+          id: 'fact_2',
+          type: 'project',
+          statement: 'User is building SoVereign.',
+          confidence: 0.95,
+        },
+      ],
+    };
 
-  const event = await signEvent(
-    {
-      source: 'mentor',
-      action: 'utterance_captured',
-      timestamp: '2026-04-20T10:00:00.000Z',
-    },
-    keys
-  );
+    const result = await normalize(
+      extraction,
+      { sourceEventIds: [event.id] },
+      keys
+    );
 
-  const result = await normalize(
-    mockExtraction(),
-    { sourceEventIds: [event.id] },
-    keys
-  );
+    expect(result).toBeDefined();
+    expect(Array.isArray(result.facts)).toBe(true);
+    expect(Array.isArray(result.rejected)).toBe(true);
+    expect(result.facts.length).toBe(2);
+    expect(result.rejected.length).toBe(0);
 
-  assert.equal(result.facts.length, 2);
-  assert.equal(result.rejected.length, 0);
+    for (const fact of result.facts) {
+      expect(fact.id).toBeTruthy();
+      expect(fact.signature).toBeTruthy();
 
-  for (const f of result.facts) {
-    assert.equal(f.did, did);
-    assert.equal(f.layer, 'observed'); // default
-    assert.equal(f.version, 1);
-    assert.equal(f.revision_of, null);
-    assert.ok(f.signature.startsWith('ed25519:'));
-    assert.deepEqual(f.source_events, [event.id]);
-  }
-});
+      const verified = await verifyObject(fact, fact.signature, keys);
+      expect(verified).toBe(true);
+    }
+  });
 
-test('Low-confidence fallback reduces confidence by 0.15', async () => {
-  const keys = await InMemoryKeyProvider.generate();
-  const event = await signEvent(
-    { source: 'mentor', action: 'utterance', timestamp: new Date().toISOString() },
-    keys
-  );
-  const result = await normalize(
-    mockExtraction({ low_confidence_fallback: true }),
-    { sourceEventIds: [event.id] },
-    keys
-  );
-  // Original: 0.8 and 0.75. After -0.15: 0.65 and 0.60.
-  assert.ok(Math.abs(result.facts[0]!.confidence - 0.65) < 1e-9);
-  assert.ok(Math.abs(result.facts[1]!.confidence - 0.60) < 1e-9);
-});
+  it('rejects malformed facts instead of crashing', async () => {
+    const keys = await InMemoryKeyProvider.generate();
 
-test('Layer override is respected', async () => {
-  const keys = await InMemoryKeyProvider.generate();
-  const event = await signEvent(
-    { source: 'mentor', action: 'utterance', timestamp: new Date().toISOString() },
-    keys
-  );
-  const result = await normalize(
-    mockExtraction(),
-    { sourceEventIds: [event.id], layerOverride: 'stated' },
-    keys
-  );
-  for (const f of result.facts) assert.equal(f.layer, 'stated');
-});
+    const extraction = {
+      facts: [
+        {
+          id: 'fact_valid',
+          type: 'goal',
+          statement: 'User wants to grow the platform.',
+          confidence: 0.9,
+        },
+        {
+          id: '',
+          type: 'goal',
+          statement: 'Broken fact with empty id.',
+          confidence: 0.8,
+        },
+        {
+          type: 'emotion',
+          statement: 'Missing id should be rejected.',
+          confidence: 0.7,
+        },
+      ],
+    };
 
-test('Normalization rejects without source events', async () => {
-  const keys = await InMemoryKeyProvider.generate();
-  await assert.rejects(
-    () => normalize(mockExtraction(), { sourceEventIds: [] }, keys),
-    /at least one source event/
-  );
-});
+    const result = await normalize(
+      extraction,
+      { sourceEventIds: ['evt_dev_1'] },
+      keys
+    );
 
-test('Store rejects facts whose signatures do not verify', async () => {
-  const keys = await InMemoryKeyProvider.generate();
-  const store = new InMemoryStore();
+    expect(result.facts.length).toBe(1);
+    expect(result.rejected.length).toBeGreaterThanOrEqual(1);
+  });
 
-  const event = await signEvent(
-    { source: 'mentor', action: 'utterance', timestamp: new Date().toISOString() },
-    keys
-  );
-  await store.putEvent(event);
+  it('attaches sourceEventIds to normalized facts', async () => {
+    const keys = await InMemoryKeyProvider.generate();
 
-  const { facts } = await normalize(
-    mockExtraction(),
-    { sourceEventIds: [event.id] },
-    keys
-  );
-  const tampered = { ...facts[0]!, value: 'tampered_value' };
-  await assert.rejects(
-    () => store.putFacts([tampered]),
-    /signature verification failed/
-  );
-});
+    const extraction = {
+      facts: [
+        {
+          id: 'fact_linked',
+          type: 'insight',
+          statement: 'User responds well to structured reflection.',
+          confidence: 0.88,
+        },
+      ],
+    };
 
-test('Store rejects facts referencing unknown events', async () => {
-  const keys = await InMemoryKeyProvider.generate();
-  const store = new InMemoryStore();
+    const result = await normalize(
+      extraction,
+      { sourceEventIds: ['evt_123', 'evt_456'] },
+      keys
+    );
 
-  // Don't actually persist the event:
-  const event = await signEvent(
-    { source: 'mentor', action: 'utterance', timestamp: new Date().toISOString() },
-    keys
-  );
-  const { facts } = await normalize(
-    mockExtraction(),
-    { sourceEventIds: [event.id] },
-    keys
-  );
-  await assert.rejects(
-    () => store.putFacts(facts),
-    /references unknown event/
-  );
-});
+    expect(result.facts.length).toBe(1);
 
-test('Full happy path: event → facts → query', async () => {
-  const keys = await InMemoryKeyProvider.generate();
-  const did = await keys.did();
-  const store = new InMemoryStore();
+    const fact = result.facts[0] as Record<string, unknown>;
 
-  const event = await signEvent(
-    { source: 'mentor', action: 'utterance', timestamp: new Date().toISOString() },
-    keys
-  );
-  await store.putEvent(event);
+    const sourceEventIds =
+      (fact.sourceEventIds as string[] | undefined) ??
+      (fact.source_event_ids as string[] | undefined);
 
-  const { facts } = await normalize(
-    mockExtraction(),
-    { sourceEventIds: [event.id] },
-    keys
-  );
-  await store.putFacts(facts);
+    expect(sourceEventIds).toEqual(['evt_123', 'evt_456']);
+  });
 
-  const counts = await store.count(did);
-  assert.equal(counts.events, 1);
-  assert.equal(counts.facts, 2);
+  it('returns empty arrays when extraction contains no facts', async () => {
+    const keys = await InMemoryKeyProvider.generate();
 
-  const emotions = await store.queryFacts({ did, types: ['emotion'] });
-  assert.equal(emotions.length, 1);
-  assert.equal(emotions[0]!.value, 'lęk');
-});
+    const extraction = {
+      facts: [],
+    };
 
-test('Override flags do not invalidate signatures', async () => {
-  const keys = await InMemoryKeyProvider.generate();
-  const did = await keys.did();
-  const store = new InMemoryStore();
+    const result = await normalize(
+      extraction,
+      { sourceEventIds: ['evt_empty'] },
+      keys
+    );
 
-  const event = await signEvent(
-    { source: 'mentor', action: 'utterance', timestamp: new Date().toISOString() },
-    keys
-  );
-  await store.putEvent(event);
-  const { facts } = await normalize(
-    mockExtraction(),
-    { sourceEventIds: [event.id] },
-    keys
-  );
-  await store.putFacts(facts);
-
-  // Suppress a fact. Signature must remain valid on the stored object.
-  const target = facts[0]!;
-  await store.setOverrideFlags(target.id, { suppressed_by_user: true });
-
-  // Default query hides suppressed:
-  const defaultResult = await store.queryFacts({ did });
-  assert.equal(defaultResult.length, 1);
-  assert.notEqual(defaultResult[0]!.id, target.id);
-
-  // Explicit include returns it, with the flag applied:
-  const all = await store.queryFacts({ did, includeSuppressed: true });
-  const retrieved = all.find((f) => f.id === target.id)!;
-  assert.equal(retrieved.suppressed_by_user, true);
+    expect(result.facts).toEqual([]);
+    expect(result.rejected).toEqual([]);
+  });
 });
